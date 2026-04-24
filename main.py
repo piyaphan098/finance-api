@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -16,43 +16,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── DATABASE CONNECTION ───────────────────────────────────────────────────────
-# ตั้งค่า DATABASE_URL ใน Render → Environment Variables
-# รูปแบบ: postgresql://user:password@host:port/dbname
+# ─── DATABASE ─────────────────────────────────────────────────────
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise Exception("❌ DATABASE_URL is not set")
+
 def get_conn():
-    """สร้าง connection ใหม่ทุกครั้ง (safe สำหรับ serverless / Render free tier)"""
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    """สร้าง table ถ้ายังไม่มี — รันตอน startup ครั้งเดียว"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
-                    id      SERIAL PRIMARY KEY,
-                    icon    TEXT    NOT NULL DEFAULT '💰',
-                    name    TEXT    NOT NULL,
-                    cat     TEXT    NOT NULL,
-                    date    TEXT    NOT NULL,
-                    amt     FLOAT   NOT NULL,
-                    type    TEXT    NOT NULL CHECK (type IN ('income','expense','invest')),
+                    id SERIAL PRIMARY KEY,
+                    icon TEXT NOT NULL DEFAULT '💰',
+                    name TEXT NOT NULL,
+                    cat TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    amt FLOAT NOT NULL,
+                    type TEXT NOT NULL CHECK (type IN ('income','expense','invest')),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+
+            # 🔥 เพิ่ม index (performance + ดูโปร)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_type ON transactions(type);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_date ON transactions(date);")
+
         conn.commit()
 
-# รัน init ตอน startup
 try:
     init_db()
-    print("✅ Database connected & table ready")
+    print("✅ Database ready")
 except Exception as e:
-    print(f"⚠️  DB init failed: {e}")
+    print(f"⚠️ DB init failed: {e}")
 
-
-# ─── MODELS ───────────────────────────────────────────────────────────────────
+# ─── MODELS ─────────────────────────────────────────────────────
 
 class Transaction(BaseModel):
     icon: str = "💰"
@@ -60,7 +62,7 @@ class Transaction(BaseModel):
     cat: str
     date: str
     amt: float
-    type: str  # income | expense | invest
+    type: Literal["income", "expense", "invest"]  # 🔥 strict validation
 
 class TransactionUpdate(BaseModel):
     icon: Optional[str] = None
@@ -68,29 +70,28 @@ class TransactionUpdate(BaseModel):
     cat: Optional[str] = None
     date: Optional[str] = None
     amt: Optional[float] = None
-    type: Optional[str] = None
+    type: Optional[Literal["income", "expense", "invest"]] = None
 
-
-# ─── ROUTES ───────────────────────────────────────────────────────────────────
+# ─── ROUTES ─────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "ฉลาดใช้ Finance API", "db": "PostgreSQL"}
-
+    return {
+        "status": "ok",
+        "app": "ฉลาดใช้ Finance API",
+        "db": "PostgreSQL"
+    }
 
 @app.get("/transactions")
 def get_transactions():
-    """ดึงรายการทั้งหมด เรียงล่าสุดก่อน"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM transactions ORDER BY created_at DESC, id DESC")
             rows = cur.fetchall()
-    return [dict(r) for r in rows]
-
+    return rows
 
 @app.post("/transaction", status_code=201)
 def add_transaction(item: Transaction):
-    """เพิ่มรายการใหม่"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -103,14 +104,12 @@ def add_transaction(item: Transaction):
             )
             new_row = cur.fetchone()
         conn.commit()
-    return dict(new_row)
-
+    return new_row
 
 @app.put("/transaction/{tx_id}")
 def update_transaction(tx_id: int, item: TransactionUpdate):
-    """แก้ไขรายการ — อัปเดตเฉพาะ field ที่ส่งมา"""
-    # สร้าง SET clause เฉพาะ field ที่ไม่ใช่ None
     fields = {k: v for k, v in item.dict().items() if v is not None}
+
     if not fields:
         raise HTTPException(status_code=400, detail="ไม่มีข้อมูลที่จะอัปเดต")
 
@@ -128,12 +127,11 @@ def update_transaction(tx_id: int, item: TransactionUpdate):
 
     if not updated:
         raise HTTPException(status_code=404, detail=f"ไม่พบรายการ id={tx_id}")
-    return dict(updated)
 
+    return updated
 
 @app.delete("/transaction/{tx_id}")
 def delete_transaction(tx_id: int):
-    """ลบรายการตาม id"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -145,12 +143,15 @@ def delete_transaction(tx_id: int):
 
     if not deleted:
         raise HTTPException(status_code=404, detail=f"ไม่พบรายการ id={tx_id}")
-    return {"message": "deleted", "id": deleted["id"], "name": deleted["name"]}
 
+    return {
+        "message": "deleted",
+        "id": deleted["id"],
+        "name": deleted["name"]
+    }
 
 @app.delete("/transactions")
 def clear_all_transactions():
-    """ลบทุกรายการ (ใช้ระวัง!)"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM transactions")
@@ -158,10 +159,8 @@ def clear_all_transactions():
         conn.commit()
     return {"message": "cleared", "deleted_count": count}
 
-
 @app.get("/health")
 def health_check():
-    """ใช้เช็คว่า DB เชื่อมต่อได้จริง"""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
